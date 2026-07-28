@@ -65,6 +65,8 @@
   .hide{display:none}
   footer{text-align:center;color:var(--faint);font-size:12px;padding:6px 0 26px}
 </style>
+<!-- 구글 캘린더 연동: GIS 로더 -->
+<script src="https://accounts.google.com/gsi/client" async></script>
 </head>
 <body>
 
@@ -199,6 +201,12 @@
         <span style="font-size:11.5px;color:var(--faint)">PDF·JPG·PNG·XLSX·ICS(팀스케줄러) · HWP는 PDF로 저장 후 첨부</span>
       </div>
       <div id="fileList" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
+      <!-- 구글 캘린더 / .ics 불러오기 -->
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn-upload" type="button" id="calBtn">📅 구글 캘린더에서 불러오기</button>
+        <button class="btn-upload" type="button" id="icsBtn">📎 .ics 파일에서 불러오기</button>
+        <input type="file" id="icsInput" accept=".ics" class="hide">
+      </div>
     </div>
 
     <div id="errBox" class="err hide"></div>
@@ -1993,5 +2001,241 @@ $('cfgReset').addEventListener('click', function(){
   flashSave('기본값으로 되돌림 — 저장하려면 ‘설정 저장’');
 });
 </script>
+
+<!-- ============================================================
+     구글 캘린더 / .ics → 체크박스 선택 → 문서종류별 자동 매핑
+     ============================================================ -->
+<style>
+  #calModal{position:fixed;inset:0;background:rgba(20,30,38,.45);display:none;align-items:center;justify-content:center;z-index:1000;padding:16px}
+  #calModal.on{display:flex}
+  #calBox{background:#fff;border-radius:16px;max-width:640px;width:100%;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--line)}
+  #calBox .h{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  #calBox .h .t{font-size:15px;font-weight:700}
+  #calBox .h .s{font-size:12px;color:var(--muted)}
+  #calList{overflow:auto;padding:8px 12px}
+  .cal-row{display:flex;align-items:center;gap:10px;padding:9px 8px;border-bottom:1px solid #F1F4F6}
+  .cal-row input[type=checkbox]{width:auto;flex:none}
+  .cal-row .info{flex:1;min-width:0}
+  .cal-row .ttl{font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cal-row .meta{font-size:11.5px;color:var(--muted)}
+  .cal-row select{width:auto;flex:none;padding:6px 8px;font-size:12px}
+  #calBox .f{padding:14px 20px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+</style>
+<div id="calModal">
+  <div id="calBox">
+    <div class="h">
+      <div><div class="t">일정 선택 · 문서에 반영</div>
+        <div class="s" id="calHint">회의만 체크하고, 필요하면 팀을 지정하세요</div></div>
+      <div class="spacer" style="margin-left:auto"></div>
+      <button class="btn-ghost" type="button" id="calAll">전체선택</button>
+    </div>
+    <div id="calList"></div>
+    <div class="f">
+      <button class="btn-ghost" type="button" id="calCancel">취소</button>
+      <button class="btn-primary" type="button" id="calApply" style="margin-top:0;width:auto;padding:10px 18px">문서에 반영</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== 설정 ===== */
+var GCAL_CLIENT_ID = "731835083578-nnuoiqilr026dqbplj75gn7di3d5mtf5.apps.googleusercontent.com";
+var GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+var _tc = null, _tok = null, _calEvents = [];
+
+/* ===== 1) 구글 캘린더 토큰 (1시간 만료 자동 재발급) ===== */
+function gcalToken() {
+  return new Promise(function (ok, no) {
+    if (!window.google || !google.accounts || !google.accounts.oauth2)
+      return no(new Error("구글 인증 스크립트 로딩 중입니다. 잠시 후 다시 시도하세요."));
+    if (!_tc) _tc = google.accounts.oauth2.initTokenClient(
+      { client_id: GCAL_CLIENT_ID, scope: GCAL_SCOPE, callback: "" });
+    if (_tok && _tok.exp - Date.now() > 300000) return ok(_tok.t);
+    _tc.callback = function (r) {
+      if (r.error) return no(new Error("인증 취소/실패: " + r.error));
+      _tok = { t: r.access_token, exp: Date.now() + (r.expires_in || 3600) * 1000 };
+      ok(r.access_token);
+    };
+    _tc.requestAccessToken({ prompt: _tok ? "" : "consent" });
+  });
+}
+
+/* 문서종류에 맞춰 조회 기간 자동 결정 */
+function calRange() {
+  var t = $('docType').value, b = new Date();
+  if (t === '주간회의') {                                   // 이번 주(월~일)
+    var d = b.getDay() || 7, mon = new Date(b); mon.setDate(b.getDate() - d + 1); mon.setHours(0,0,0,0);
+    var sun = new Date(mon); sun.setDate(mon.getDate() + 6); sun.setHours(23,59,59,0);
+    return [mon, sun];
+  }
+  if (t === '월간회의' || t === '부서장회의') {              // 이번 달
+    return [new Date(b.getFullYear(), b.getMonth(), 1),
+            new Date(b.getFullYear(), b.getMonth() + 1, 0, 23, 59, 59)];
+  }
+  var f = new Date(b); f.setHours(0,0,0,0);                  // 오늘
+  var to = new Date(b); to.setHours(23,59,59,0);
+  return [f, to];
+}
+
+async function gcalFetch() {
+  var tk = await gcalToken();
+  var r = calRange();
+  var u = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    + "?timeMin=" + encodeURIComponent(r[0].toISOString())
+    + "&timeMax=" + encodeURIComponent(r[1].toISOString())
+    + "&singleEvents=true&orderBy=startTime";
+  var res = await fetch(u, { headers: { Authorization: "Bearer " + tk } });
+  if (res.status === 401) { _tok = null; throw new Error("인증이 만료되었습니다. 다시 시도하세요."); }
+  if (!res.ok) throw new Error("캘린더 조회 실패 (" + res.status + ")");
+  var d = await res.json();
+  return (d.items || []).map(function (e) {
+    return {
+      title: e.summary || "(제목 없음)",
+      start: (e.start && (e.start.dateTime || e.start.date)) || "",
+      location: e.location || "",
+      description: e.description || ""
+    };
+  });
+}
+
+/* ===== 3) .ics 파싱 — 캘린더와 동일한 이벤트 형식으로 ===== */
+function parseIcs(text) {
+  var out = [], blocks = text.split("BEGIN:VEVENT").slice(1);
+  blocks.forEach(function (b) {
+    function g(re) { var m = b.match(re); return m ? m[1].trim() : ""; }
+    out.push({
+      title: g(/SUMMARY:(.*)/) || "(제목 없음)",
+      start: icsDate(g(/DTSTART[^:]*:([0-9TZ]+)/)),
+      location: g(/LOCATION:(.*)/).replace(/\\,/g, ","),
+      description: g(/DESCRIPTION:(.*)/).replace(/\\n/g, " ").replace(/\\,/g, ",")
+    });
+  });
+  return out;
+}
+function icsDate(s) {                                        // 20260715T140000 → 2026-07-15T14:00
+  if (!s) return "";
+  var m = s.match(/(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/);
+  return m ? (m[1] + "-" + m[2] + "-" + m[3] + (m[4] ? "T" + m[4] + ":" + m[5] : "")) : s;
+}
+
+/* ===== 팀 자동 추정 ===== */
+function guessTeam(ev) {
+  var s = (ev.title + " " + ev.description);
+  for (var i = 0; i < TEAMS.length; i++) if (s.indexOf(TEAMS[i]) !== -1) return TEAMS[i];
+  if (/생명|자살|생존지킴/.test(s)) return '생명존중1팀';
+  if (/정신건강|사례관리|재활/.test(s)) return '정신건강팀';
+  if (/운영|회계|서무|행정/.test(s)) return '센터운영';
+  return '';                                                 // 미지정
+}
+
+/* ===== 2) 선택 모달 렌더 ===== */
+function openEventPicker(events) {
+  if (!events || !events.length) { alert("해당 기간에 일정이 없습니다."); return; }
+  _calEvents = events;
+  var teamOpts = ['<option value="">(팀 미지정)</option>']
+    .concat(TEAMS.map(function (t) { return '<option>' + t + '</option>'; })).join('');
+  $('calList').innerHTML = events.map(function (ev, i) {
+    var t = ev.start ? ev.start.replace('T', ' ').slice(5, 16) : '';
+    var team = guessTeam(ev);
+    return '<div class="cal-row">'
+      + '<input type="checkbox" data-i="' + i + '" checked>'
+      + '<div class="info"><div class="ttl">' + escapeHtml(ev.title) + '</div>'
+      + '<div class="meta">' + t + (ev.location ? ' · ' + escapeHtml(ev.location) : '') + '</div></div>'
+      + '<select data-team="' + i + '">' + teamOpts.replace('>' + team + '<', ' selected>' + team + '<') + '</select>'
+      + '</div>';
+  }).join('');
+  $('calModal').classList.add('on');
+}
+function escapeHtml(s){return (s||'').replace(/[&<>"]/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]);});}
+function closePicker(){ $('calModal').classList.remove('on'); }
+
+/* ===== 1) 문서종류별 매핑 ===== */
+function applyPicked() {
+  var picks = [];
+  Array.prototype.forEach.call($('calList').querySelectorAll('input[type=checkbox]'), function (cb) {
+    if (!cb.checked) return;
+    var i = +cb.getAttribute('data-i');
+    var sel = $('calList').querySelector('select[data-team="' + i + '"]');
+    picks.push({ ev: _calEvents[i], team: sel ? sel.value : '' });
+  });
+  if (!picks.length) { alert("선택된 일정이 없습니다."); return; }
+
+  var type = $('docType').value;
+  var dates = picks.map(function (p) { return (p.ev.start || '').slice(0, 10); })
+                   .filter(Boolean).sort();
+  var period = dates.length ? (fmtK(dates[0]) + " ~ " + fmtK(dates[dates.length - 1])) : '';
+
+  if (type === '팀회의록') {
+    var ev = picks[0].ev;
+    setField('부서', picks[0].team || TEAMS[0]);
+    setField('일시', ev.start.replace('T', ' '));
+    setField('안건', ev.title + (ev.description ? ' / ' + ev.description : ''));
+  } else if (type === '주간회의' || type === '월간회의') {
+    setField('대상기간', period);
+    injectMemo(groupByTeam(picks));                          // 팀별 분배
+  } else if (type === '부서장회의') {
+    setField('대상기간', period);
+    injectMemo(flatList(picks));
+  } else {                                                   // 교육·출장 등
+    var e0 = picks[0].ev;
+    if (fieldExists('일시')) setField('일시', e0.start.replace('T', ' '));
+    if (fieldExists('장소')) setField('장소', e0.location);
+    injectMemo(flatList(picks));
+  }
+  closePicker();
+  alert("선택한 일정을 문서에 반영했습니다. 내용을 확인 후 [보고서 생성]을 누르세요.");
+}
+
+/* 팀별 그룹핑 → 주간/월간회의 원본 메모용 */
+function groupByTeam(picks) {
+  var groups = {}; TEAMS.forEach(function (t) { groups[t] = []; }); groups['기타'] = [];
+  picks.forEach(function (p) { (groups[p.team] || groups['기타']).push(p.ev); });
+  var out = '';
+  Object.keys(groups).forEach(function (t) {
+    if (!groups[t].length) return;
+    out += '## ' + t + '\n' + groups[t].map(evLine).join('\n') + '\n\n';
+  });
+  return out.trim();
+}
+function flatList(picks) { return picks.map(function (p) { return evLine(p.ev); }).join('\n'); }
+function evLine(e) {
+  return '- ' + (e.start ? e.start.replace('T', ' ').slice(0, 16) : '') + ' ' + e.title
+    + (e.location ? ' @' + e.location : '')
+    + (e.description ? '\n  · ' + e.description : '');
+}
+function injectMemo(text) { var m = $('memo'); m.value = (m.value ? m.value + '\n' : '') + text; }
+
+/* form 전역 + 화면 입력(data-k) 동시 갱신 */
+function setField(k, v) {
+  form[k] = v;
+  var el = document.querySelector('#formFields [data-k="' + k + '"]');
+  if (el) el.value = v;
+}
+function fieldExists(k) {
+  return fieldsFor($('docType').value).some(function (f) { return f.k === k; });
+}
+function fmtK(iso) { var p = iso.split('-'); return p[0] + '. ' + (+p[1]) + '. ' + (+p[2]) + '.'; }
+
+/* ===== 이벤트 바인딩 ===== */
+$('calBtn').addEventListener('click', function () {
+  gcalFetch().then(openEventPicker).catch(function (e) { alert(e.message); });
+});
+$('icsBtn').addEventListener('click', function () { $('icsInput').click(); });
+$('icsInput').addEventListener('change', function (e) {
+  var f = e.target.files[0]; if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function () { try { openEventPicker(parseIcs(rd.result)); } catch (err) { alert('ics 파싱 실패: ' + err.message); } };
+  rd.readAsText(f); e.target.value = '';
+});
+$('calAll').addEventListener('click', function () {
+  var cbs = $('calList').querySelectorAll('input[type=checkbox]');
+  var allOn = Array.prototype.every.call(cbs, function (c) { return c.checked; });
+  Array.prototype.forEach.call(cbs, function (c) { c.checked = !allOn; });
+});
+$('calApply').addEventListener('click', applyPicked);
+$('calCancel').addEventListener('click', closePicker);
+$('calModal').addEventListener('click', function (e) { if (e.target === $('calModal')) closePicker(); });
+</script>
+
 </body>
 </html>
